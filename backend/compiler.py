@@ -67,6 +67,167 @@ def _ttir_to_ttsharedir(mod):
         return Path(dst_path).read_text()
 
 
+def _use_pim_ir() -> bool:
+    return os.getenv("TRITON_USE_PIM", "").lower() in ("1", "true", "on", "yes", "y")
+
+
+# Match linalg.matmul (and triton_gpu.dot if it appears in the future) and capture
+# ins/outs/return tensor payload so we can preserve operands.
+_MATMUL_PATTERN = re.compile(
+    r"(linalg\.matmul)\s+ins\((?P<ins>[^)]*)\)\s+outs\((?P<outs>[^)]*)\)\s*->\s*(?P<ret>tensor<[^>]+>)",
+    re.DOTALL,
+)
+
+_PIM_ATTR_PATTERN = re.compile(
+    r"pim\.matmul.*?attributes\s*\{(?P<attrs>[^}]+)\}",
+    re.DOTALL,
+)
+
+
+def _extract_pim_meta(ttsharedir: str) -> dict:
+    match = _PIM_ATTR_PATTERN.search(ttsharedir)
+    if not match:
+        return {}
+    attrs = match.group("attrs")
+
+    def _parse_int(key: str):
+        m = re.search(rf"{key}\s*=\s*([0-9]+)", attrs)
+        return int(m.group(1)) if m else None
+
+    def _parse_bool(key: str):
+        m = re.search(rf"{key}\s*=\s*(true|false)", attrs)
+        if not m:
+            return None
+        return m.group(1) == "true"
+
+    def _parse_list(key: str):
+        m = re.search(rf"{key}\s*=\s*\[([^\]]+)\]", attrs)
+        if not m:
+            return None
+        return [int(x.strip()) for x in m.group(1).split(",") if x.strip()]
+
+    def _parse_str(key: str):
+        m = re.search(rf'{key}\s*=\s*"([^"]+)"', attrs)
+        return m.group(1) if m else None
+
+    meta = {}
+    for key in ("pim.a_ptr", "pim.b_ptr", "pim.c_ptr",
+                "pim.m_arg", "pim.n_arg", "pim.k_arg", "pim.batch_arg"):
+        val = _parse_int(key)
+        if val is not None:
+            meta[key.split(".")[1]] = val
+    block = _parse_list("pim.block")
+    if block:
+        meta["block"] = block
+    transb = _parse_bool("pim.transb")
+    if transb is not None:
+        meta["transb"] = transb
+    dtype = _parse_str("pim.dtype")
+    if dtype:
+        meta["dtype"] = dtype
+    return meta
+
+
+def _rewrite_matmul_to_pim(ttsharedir: str) -> str:
+    """Replace matmul with a placeholder pim.matmul op in TTShared-IR."""
+
+    def _find_arg_index(arg_name: str):
+        pattern = rf'%arg(?P<idx>\d+):\s*[^)]*loc\("{arg_name}"'
+        match = re.search(pattern, ttsharedir)
+        if not match:
+            return None
+        return int(match.group("idx"))
+
+    def _parse_shape(shape_str: str):
+        tokens = shape_str.split("x")
+        if len(tokens) < 2:
+            return [], shape_str
+        dtype = tokens[-1]
+        dims = []
+        for t in tokens[:-1]:
+            try:
+                dims.append(int(t))
+            except ValueError:
+                dims.append(t)
+        return dims, dtype
+
+    def _fmt_dims(dims):
+        parts = []
+        for d in dims:
+            parts.append(str(d))
+        return "[" + ", ".join(parts) + "]"
+
+    arg_indices = {
+        "a_ptr": _find_arg_index("a_ptr"),
+        "b_ptr": _find_arg_index("b_ptr"),
+        "c_ptr": _find_arg_index("c_ptr"),
+        "b": _find_arg_index("b"),
+        "m": _find_arg_index("m"),
+        "n": _find_arg_index("n"),
+        "k": _find_arg_index("k"),
+    }
+
+    def _replace(match: re.Match) -> str:
+        ins = match.group("ins").strip()
+        outs = match.group("outs").strip()
+        ret = match.group("ret").strip()
+        shapes = re.findall(r"tensor<([^>]+)>", match.group(0))
+        a_dims = b_dims = a_dtype = b_dtype = None
+        if len(shapes) >= 2:
+            a_dims, a_dtype = _parse_shape(shapes[0])
+            b_dims, b_dtype = _parse_shape(shapes[1])
+        attr_parts = []
+        if a_dims is not None:
+            attr_parts.append(f"pim.a_shape = {_fmt_dims(a_dims)}")
+            attr_parts.append(f'pim.a_dtype = "{a_dtype}"')
+        if b_dims is not None:
+            attr_parts.append(f"pim.b_shape = {_fmt_dims(b_dims)}")
+            attr_parts.append(f'pim.b_dtype = "{b_dtype}"')
+        if a_dims and b_dims and len(a_dims) == 2 and len(b_dims) == 2:
+            block = [a_dims[0], a_dims[1], b_dims[1]]
+            attr_parts.append(f"pim.block = {_fmt_dims(block)}")
+            if a_dims[1] == b_dims[0]:
+                attr_parts.append("pim.transb = false")
+            elif a_dims[1] == b_dims[1]:
+                attr_parts.append("pim.transb = true")
+        if a_dtype and b_dtype and a_dtype == b_dtype:
+            attr_parts.append(f'pim.dtype = "{a_dtype}"')
+        if arg_indices["a_ptr"] is not None:
+            attr_parts.append(f"pim.a_ptr = {arg_indices['a_ptr']}")
+        if arg_indices["b_ptr"] is not None:
+            attr_parts.append(f"pim.b_ptr = {arg_indices['b_ptr']}")
+        if arg_indices["c_ptr"] is not None:
+            attr_parts.append(f"pim.c_ptr = {arg_indices['c_ptr']}")
+        if arg_indices["b"] is not None:
+            attr_parts.append(f"pim.batch_arg = {arg_indices['b']}")
+        if arg_indices["m"] is not None:
+            attr_parts.append(f"pim.m_arg = {arg_indices['m']}")
+        if arg_indices["n"] is not None:
+            attr_parts.append(f"pim.n_arg = {arg_indices['n']}")
+        if arg_indices["k"] is not None:
+            attr_parts.append(f"pim.k_arg = {arg_indices['k']}")
+        attr_parts.append(f'pim.ret = "{ret}"')
+        attr_str = ""
+        if attr_parts:
+            attr_str = " attributes {" + ", ".join(attr_parts) + "}"
+        return f"pim.matmul ins({ins}) outs({outs}) -> {ret}{attr_str}"
+
+    return _MATMUL_PATTERN.sub(_replace, ttsharedir)
+
+
+def _ttsharedir_to_pimir(ttsharedir: str, metadata: dict) -> str:
+    # Placeholder for PIM-specific lowering from TritonShared-IR to PIM-IR.
+    print("[triton-shared] Converting ttsharedir -> PIM IR (TRITON_USE_PIM set).")
+    # Step 1: rewrite matmul to PIM placeholder
+    ttsharedir_pim = _rewrite_matmul_to_pim(ttsharedir)
+    metadata["pim_meta"] = _extract_pim_meta(ttsharedir_pim)
+    # ttsharedir_pim can be dumped for debugging
+    dump_dir = os.getenv("TRITON_SHARED_DUMP_PATH")
+    if dump_dir:
+        Path(os.path.join(dump_dir, "ttshared_pim.mlir")).write_text(ttsharedir_pim)
+    return _ttsharedir_to_llir(ttsharedir)
+
+
 def _optimize_ttsharedir(ttsharedir: str):
     # We don't apply any optimizations now, but we can add passes if needed.
     return ttsharedir
@@ -226,6 +387,7 @@ class CPUBackend(BaseBackend):
         # Note: We actually don't need any of these except for the name which is
         # used in the launch function in driver.py. Putting these in so we're
         # consistent with other backends
+        pim_meta = metadata.pim_meta if hasattr(metadata, "pim_meta") else None
         return (
             metadata.num_warps,
             metadata.num_ctas,
@@ -233,7 +395,8 @@ class CPUBackend(BaseBackend):
             metadata.cluster_dims[0],
             metadata.cluster_dims[1],
             metadata.cluster_dims[2],
-            metadata.name
+            metadata.name,
+            pim_meta,
         )
 
     # Our compilation pipeline isn't in python like nvidia or amd, no need to load
@@ -260,9 +423,14 @@ class CPUBackend(BaseBackend):
         return mod
 
     def add_stages(self, stages, options, language):
+        print("[add stages]")
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
         stages["ttsharedir"] = lambda src, metadata: _optimize_ttsharedir(_ttir_to_ttsharedir(src))
-        stages["llir"] = lambda src, metadata: _optimize_llir(_ttsharedir_to_llir(src))
+        if _use_pim_ir():
+            print("[triton-shared] Using PIM IR lowering path.")
+            stages["llir"] = lambda src, metadata: _optimize_llir(_ttsharedir_to_pimir(src, metadata))
+        else:
+            stages["llir"] = lambda src, metadata: _optimize_llir(_ttsharedir_to_llir(src))
         stages["obj"] = lambda src, metadata: _llir_to_bin(src, metadata)
 
 

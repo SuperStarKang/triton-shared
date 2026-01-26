@@ -37,6 +37,74 @@ def _sanitizer_available(sanitizer_type):
     
     return True
 
+def _use_pim():
+    return os.getenv("TRITON_USE_PIM", "").lower() in ("1", "true", "on", "yes", "y")
+
+def _get_ptr(obj):
+    if isinstance(obj, int):
+        return obj
+    if obj is None:
+        return 0
+    if hasattr(obj, "data_ptr"):
+        return int(obj.data_ptr())
+    return int(obj)
+
+def _launch_pim(pim_meta, args):
+    # Lazy import to avoid loading DPU runtime when not needed.
+    from . import pim_runtime
+
+    if not pim_meta:
+        raise RuntimeError("PIM launch requested but pim_meta is missing")
+
+    a_idx = pim_meta.get("a_ptr")
+    b_idx = pim_meta.get("b_ptr")
+    c_idx = pim_meta.get("c_ptr")
+    m_idx = pim_meta.get("m_arg")
+    n_idx = pim_meta.get("n_arg")
+    k_idx = pim_meta.get("k_arg")
+
+    if a_idx is None or b_idx is None or c_idx is None:
+        raise RuntimeError("Missing PIM pointer indices in metadata")
+    if m_idx is None or n_idx is None or k_idx is None:
+        raise RuntimeError("Missing PIM M/N/K indices in metadata")
+
+    a_ptr = _get_ptr(args[a_idx])
+    b_ptr = _get_ptr(args[b_idx])
+    c_ptr = _get_ptr(args[c_idx])
+    m = int(args[m_idx])
+    n = int(args[n_idx])
+    k = int(args[k_idx])
+
+    block = pim_meta.get("block", None)
+    if not block or len(block) != 3:
+        raise RuntimeError("Missing PIM block metadata")
+    bm, bk, bn = [int(x) for x in block]
+
+    transb = 1 if pim_meta.get("transb", False) else 0
+    ndpu = int(os.getenv("TRITON_PIM_NDPU", "1"))
+    dpu_binary = os.getenv(
+        "TRITON_PIM_DPU_BINARY",
+        "/home/dlrkdals/PGEMMlib/PGEMMLib_With_AutoTuner/dpu/gemm_dpu_b",
+    )
+
+    rc = pim_runtime.pim_launch(
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        m,
+        k,
+        n,
+        bm,
+        bk,
+        bn,
+        ndpu,
+        transb,
+        dpu_binary,
+    )
+    if rc != 0:
+        raise RuntimeError(f"PIM launch failed with code {rc}")
+    return None
+
 # -------------------- Launcher ----------------------------
 def _ty_to_cpp(ty):
     if ty[0] == '*':
@@ -263,6 +331,9 @@ def compile_module(launcher_src, kernel_placeholder_name):
         gridX, gridY, gridZ, stream, cu_function,
         kernel_metadata, launch_metadata,
         launch_enter_hook, launch_exit_hook, *args):
+        if _use_pim():
+            pim_meta = kernel_metadata[7] if len(kernel_metadata) > 7 else None
+            return _launch_pim(pim_meta, args)
         # Unlike CUDA/HIP, we cannot easily pass function pointer across different pybind libraries.
         # Let's compile one kernel every time.
         # The cu_function parameter actually contains our kernel obj.
