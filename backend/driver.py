@@ -84,7 +84,7 @@ def _launch_pim(pim_meta, args):
     ndpu = int(os.getenv("TRITON_PIM_NDPU", "1"))
     dpu_binary = os.getenv(
         "TRITON_PIM_DPU_BINARY",
-        "/home/dlrkdals/PGEMMlib/PGEMMLib_With_AutoTuner/dpu/gemm_dpu_b",
+        "/home/dlrkdals/PGEMMlib/PGEMMLib_With_AutoTuner/dpu/gemm_dpu_triton",
     )
 
     rc = pim_runtime.pim_launch(
@@ -331,8 +331,8 @@ def compile_module(launcher_src, kernel_placeholder_name):
         gridX, gridY, gridZ, stream, cu_function,
         kernel_metadata, launch_metadata,
         launch_enter_hook, launch_exit_hook, *args):
-        if _use_pim():
-            pim_meta = kernel_metadata[7] if len(kernel_metadata) > 7 else None
+        pim_meta = kernel_metadata[7] if len(kernel_metadata) > 7 else None
+        if _use_pim() and pim_meta:
             return _launch_pim(pim_meta, args)
         # Unlike CUDA/HIP, we cannot easily pass function pointer across different pybind libraries.
         # Let's compile one kernel every time.

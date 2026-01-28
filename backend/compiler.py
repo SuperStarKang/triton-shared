@@ -217,13 +217,16 @@ def _rewrite_matmul_to_pim(ttsharedir: str) -> str:
 
 def _ttsharedir_to_pimir(ttsharedir: str, metadata: dict) -> str:
     # Placeholder for PIM-specific lowering from TritonShared-IR to PIM-IR.
-    print("[triton-shared] Converting ttsharedir -> PIM IR (TRITON_USE_PIM set).")
     # Step 1: rewrite matmul to PIM placeholder
     ttsharedir_pim = _rewrite_matmul_to_pim(ttsharedir)
-    metadata["pim_meta"] = _extract_pim_meta(ttsharedir_pim)
+    pim_meta = _extract_pim_meta(ttsharedir_pim)
+    metadata["pim_meta"] = pim_meta if pim_meta else None
+    # if pim_meta: # debug print
+    #     print("[triton-shared] Converting ttsharedir -> PIM IR (pim.matmul found).")
+
     # ttsharedir_pim can be dumped for debugging
     dump_dir = os.getenv("TRITON_SHARED_DUMP_PATH")
-    if dump_dir:
+    if dump_dir and pim_meta:
         Path(os.path.join(dump_dir, "ttshared_pim.mlir")).write_text(ttsharedir_pim)
     return _ttsharedir_to_llir(ttsharedir)
 
@@ -423,11 +426,11 @@ class CPUBackend(BaseBackend):
         return mod
 
     def add_stages(self, stages, options, language):
-        print("[add stages]")
+        # print("[add stages]")
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
         stages["ttsharedir"] = lambda src, metadata: _optimize_ttsharedir(_ttir_to_ttsharedir(src))
         if _use_pim_ir():
-            print("[triton-shared] Using PIM IR lowering path.")
+            # print("[triton-shared] Using PIM IR lowering path.")
             stages["llir"] = lambda src, metadata: _optimize_llir(_ttsharedir_to_pimir(src, metadata))
         else:
             stages["llir"] = lambda src, metadata: _optimize_llir(_ttsharedir_to_llir(src))
