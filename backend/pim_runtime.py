@@ -10,7 +10,7 @@ def _load_lib():
         return _LIB
     lib_path = os.getenv(
         "TRITON_PIM_LIB",
-        "/home/dlrkdals/PGEMMlib/PGEMMLib_With_AutoTuner/lib/libPGEMM.so",
+        "/home/dlrkdals/Triton/pgemm/lib/libPGEMM.so",
     )
     _LIB = ctypes.CDLL(lib_path)
     _LIB.triton_pim_init.argtypes = [ctypes.c_char_p, ctypes.c_uint32]
@@ -27,8 +27,11 @@ def _load_lib():
         ctypes.c_uint32,  # BM
         ctypes.c_uint32,  # BK
         ctypes.c_uint32,  # BN
+        ctypes.c_uint32,  # grid_m (from Triton grid lambda; 0 = auto-compute)
+        ctypes.c_uint32,  # grid_n (from Triton grid lambda; 0 = auto-compute)
         ctypes.c_uint32,  # nr_of_dpus
         ctypes.c_uint32,  # transb
+        ctypes.c_uint32,  # schedule_policy
         ctypes.c_char_p,  # dpu_binary_path
     ]
     _LIB.triton_pim_kernel_launch.restype = ctypes.c_int
@@ -57,7 +60,10 @@ def pim_launch(
     bn,
     nr_of_dpus,
     transb,
+    schedule_policy,
     dpu_binary_path,
+    grid_m=0,
+    grid_n=0,
 ):
     lib = _load_lib()
     return lib.triton_pim_kernel_launch(
@@ -70,7 +76,10 @@ def pim_launch(
         bm,
         bk,
         bn,
+        grid_m,
+        grid_n,
         nr_of_dpus,
         transb,
+        schedule_policy,
         dpu_binary_path.encode(),
     )

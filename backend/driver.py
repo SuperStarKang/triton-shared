@@ -49,7 +49,7 @@ def _get_ptr(obj):
         return int(obj.data_ptr())
     return int(obj)
 
-def _launch_pim(pim_meta, args):
+def _launch_pim(pim_meta, args, grid_m=0, grid_n=0):
     # Lazy import to avoid loading DPU runtime when not needed.
     from . import pim_runtime
 
@@ -81,6 +81,11 @@ def _launch_pim(pim_meta, args):
     bm, bk, bn = [int(x) for x in block]
 
     transb = 1 if pim_meta.get("transb", False) else 0
+    schedule = pim_meta.get("schedule", "global_tile_static")
+    if schedule == "global_tile_static":
+        schedule_policy = 1
+    else:
+        raise RuntimeError(f"Unsupported PIM schedule policy: {schedule}")
     ndpu = int(os.getenv("TRITON_PIM_NDPU", "1"))
     dpu_binary = os.getenv(
         "TRITON_PIM_DPU_BINARY",
@@ -99,7 +104,10 @@ def _launch_pim(pim_meta, args):
         bn,
         ndpu,
         transb,
+        schedule_policy,
         dpu_binary,
+        grid_m=grid_m,
+        grid_n=grid_n,
     )
     if rc != 0:
         raise RuntimeError(f"PIM launch failed with code {rc}")
@@ -333,7 +341,7 @@ def compile_module(launcher_src, kernel_placeholder_name):
         launch_enter_hook, launch_exit_hook, *args):
         pim_meta = kernel_metadata[7] if len(kernel_metadata) > 7 else None
         if _use_pim() and pim_meta:
-            return _launch_pim(pim_meta, args)
+            return _launch_pim(pim_meta, args, grid_m=gridX, grid_n=gridY)
         # Unlike CUDA/HIP, we cannot easily pass function pointer across different pybind libraries.
         # Let's compile one kernel every time.
         # The cu_function parameter actually contains our kernel obj.
