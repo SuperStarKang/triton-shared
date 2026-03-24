@@ -97,23 +97,44 @@ def _extract_upmem_meta(annotated_ir: str) -> dict:
     if not all(k in int_attrs for k in ("bm", "bk", "bn")):
         return {}
 
-    required_indices = ("a_ptr_idx", "b_ptr_idx", "c_ptr_idx",
-                        "m_idx", "n_idx", "k_idx")
-    if not all(k in int_attrs for k in required_indices):
+    required_pointer_indices = ("a_ptr_idx", "b_ptr_idx", "c_ptr_idx")
+    if not all(k in int_attrs for k in required_pointer_indices):
         return {}
 
-    return {
+    has_runtime_sizes = all(k in int_attrs for k in ("m_idx", "n_idx", "k_idx"))
+    has_static_sizes = all(k in int_attrs for k in ("m_val", "n_val", "k_val"))
+    if not has_runtime_sizes and not has_static_sizes:
+        return {}
+
+    meta = {
         "a_ptr":    int_attrs["a_ptr_idx"],
         "b_ptr":    int_attrs["b_ptr_idx"],
         "c_ptr":    int_attrs["c_ptr_idx"],
-        "m_arg":    int_attrs["m_idx"],
-        "n_arg":    int_attrs["n_idx"],
-        "k_arg":    int_attrs["k_idx"],
         "block":    [int_attrs["bm"], int_attrs["bk"], int_attrs["bn"]],
         "transb":   False,
         "dtype":    str_attrs.get("elem_type", "i8"),
         "schedule": "global_tile_static",
+        "launch_kind": str_attrs.get("launch_kind", "grid2d"),
     }
+    if "group_m" in int_attrs:
+        meta["group_m"] = int_attrs["group_m"]
+    if has_runtime_sizes:
+        meta.update(
+            {
+                "m_arg": int_attrs["m_idx"],
+                "n_arg": int_attrs["n_idx"],
+                "k_arg": int_attrs["k_idx"],
+            }
+        )
+    else:
+        meta.update(
+            {
+                "m_val": int_attrs["m_val"],
+                "n_val": int_attrs["n_val"],
+                "k_val": int_attrs["k_val"],
+            }
+        )
+    return meta
 
 
 def _ttsharedir_to_pimir(ttsharedir: str, metadata: dict) -> str:

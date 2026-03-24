@@ -6,6 +6,8 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Ptr/IR/PtrDialect.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+// for torch inductor
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
@@ -48,6 +50,6 @@ inline void registerTritonSharedDialects(mlir::DialectRegistry &registry) {
       mlir::triton::TritonDialect, mlir::cf::ControlFlowDialect,
       mlir::math::MathDialect, mlir::arith::ArithDialect, mlir::scf::SCFDialect,
       mlir::linalg::LinalgDialect, mlir::func::FuncDialect,
-      mlir::tensor::TensorDialect, mlir::memref::MemRefDialect,
+      mlir::tensor::TensorDialect, mlir::LLVM::LLVMDialect, mlir::memref::MemRefDialect, // LLVMDialect for torch inductor
       mlir::bufferization::BufferizationDialect>();
 }

@@ -49,9 +49,14 @@ def _get_ptr(obj):
         return int(obj.data_ptr())
     return int(obj)
 
+
+def _ceil_div(numerator, denominator):
+    return (numerator + denominator - 1) // denominator
+
 def _launch_pim(pim_meta, args, grid_m=0, grid_n=0):
     # Lazy import to avoid loading DPU runtime when not needed.
     from . import pim_runtime
+    from . import pim_autotune
 
     if not pim_meta:
         raise RuntimeError("PIM launch requested but pim_meta is missing")
@@ -62,23 +67,32 @@ def _launch_pim(pim_meta, args, grid_m=0, grid_n=0):
     m_idx = pim_meta.get("m_arg")
     n_idx = pim_meta.get("n_arg")
     k_idx = pim_meta.get("k_arg")
+    m_val = pim_meta.get("m_val")
+    n_val = pim_meta.get("n_val")
+    k_val = pim_meta.get("k_val")
 
     if a_idx is None or b_idx is None or c_idx is None:
         raise RuntimeError("Missing PIM pointer indices in metadata")
-    if m_idx is None or n_idx is None or k_idx is None:
-        raise RuntimeError("Missing PIM M/N/K indices in metadata")
-
     a_ptr = _get_ptr(args[a_idx])
     b_ptr = _get_ptr(args[b_idx])
     c_ptr = _get_ptr(args[c_idx])
-    m = int(args[m_idx])
-    n = int(args[n_idx])
-    k = int(args[k_idx])
+
+    if m_idx is not None and n_idx is not None and k_idx is not None:
+        m = int(args[m_idx])
+        n = int(args[n_idx])
+        k = int(args[k_idx])
+    elif m_val is not None and n_val is not None and k_val is not None:
+        m = int(m_val)
+        n = int(n_val)
+        k = int(k_val)
+    else:
+        raise RuntimeError("Missing PIM M/N/K metadata")
 
     block = pim_meta.get("block", None)
     if not block or len(block) != 3:
         raise RuntimeError("Missing PIM block metadata")
     bm, bk, bn = [int(x) for x in block]
+    launch_kind = pim_meta.get("launch_kind", "grid2d")
 
     transb = 1 if pim_meta.get("transb", False) else 0
     schedule = pim_meta.get("schedule", "global_tile_static")
@@ -92,25 +106,29 @@ def _launch_pim(pim_meta, args, grid_m=0, grid_n=0):
         "/home/dlrkdals/PGEMMlib/PGEMMLib_With_AutoTuner/dpu/gemm_dpu_triton",
     )
 
-    rc = pim_runtime.pim_launch(
-        a_ptr,
-        b_ptr,
-        c_ptr,
-        m,
-        k,
-        n,
-        bm,
-        bk,
-        bn,
-        ndpu,
-        transb,
-        schedule_policy,
-        dpu_binary,
-        grid_m=grid_m,
-        grid_n=grid_n,
+    effective_grid_m = grid_m
+    effective_grid_n = grid_n
+    if launch_kind == "flattened_grouped_mm":
+        effective_grid_m = _ceil_div(m, bm)
+        effective_grid_n = _ceil_div(n, bn)
+    elif effective_grid_m == 0 or effective_grid_n == 0:
+        effective_grid_m = _ceil_div(m, bm)
+        effective_grid_n = _ceil_div(n, bn)
+
+    # Determine best active_dpus via autotune (sweep on first call, cache thereafter)
+    active_dpus = pim_autotune.get_best_active_dpus(
+        m, n, k, bm, bk, bn, ndpu, transb, schedule_policy, dpu_binary,
+        a_ptr, b_ptr, c_ptr, effective_grid_m, effective_grid_n,
     )
-    if rc != 0:
-        raise RuntimeError(f"PIM launch failed with code {rc}")
+
+    pim_runtime.pim_launch(
+        a_ptr, b_ptr, c_ptr,
+        m, k, n,
+        bm, bk, bn,
+        ndpu, transb, schedule_policy, dpu_binary,
+        grid_m=effective_grid_m, grid_n=effective_grid_n,
+        forced_active_dpus=active_dpus,
+    )
     return None
 
 # -------------------- Launcher ----------------------------
