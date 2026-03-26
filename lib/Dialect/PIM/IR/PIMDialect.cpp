@@ -26,7 +26,7 @@ void PIMDialect::initialize() {
 }
 
 //===----------------------------------------------------------------------===//
-// PIMExecutionPlanAttr – custom assembly format
+// ExecutionPlanAttr – custom assembly format
 //
 // Text form:
 //   #pim.execution_plan<tile_m = 64, tile_n = 64, tile_k = 512,
@@ -38,7 +38,7 @@ void PIMDialect::initialize() {
 //                       group_m = 0, batch_count = 1>
 //===----------------------------------------------------------------------===//
 
-void PIMExecutionPlanAttr::print(AsmPrinter &p) const {
+void ExecutionPlanAttr::print(AsmPrinter &p) const {
   p << "<";
   p << "tile_m = " << getTileM();
   p << ", tile_n = " << getTileN();
@@ -58,7 +58,7 @@ void PIMExecutionPlanAttr::print(AsmPrinter &p) const {
   p << ">";
 }
 
-Attribute PIMExecutionPlanAttr::parse(AsmParser &parser, Type /*odsType*/) {
+Attribute ExecutionPlanAttr::parse(AsmParser &parser, Type /*odsType*/) {
   int64_t tile_m = 0, tile_n = 0, tile_k = 0;
   int32_t tasklets = 0, active_dpus = 0, alignment = 0, group_m = 0,
           batch_count = 0;
@@ -70,25 +70,26 @@ Attribute PIMExecutionPlanAttr::parse(AsmParser &parser, Type /*odsType*/) {
   AccumType accum_type = AccumType::UNKNOWN;
   WritebackMode writeback_mode = WritebackMode::UNKNOWN;
 
+  // parseKeyword requires StringRef* in this MLIR version.
   auto parseKeyValue = [&]() -> ParseResult {
-    std::string key;
+    StringRef key;
     if (parser.parseKeyword(&key))
       return failure();
     if (parser.parseEqual())
       return failure();
 
     // Integer fields
-    if (key == "tile_m")     return parser.parseInteger(tile_m);
-    if (key == "tile_n")     return parser.parseInteger(tile_n);
-    if (key == "tile_k")     return parser.parseInteger(tile_k);
-    if (key == "tasklets")   return parser.parseInteger(tasklets);
+    if (key == "tile_m")      return parser.parseInteger(tile_m);
+    if (key == "tile_n")      return parser.parseInteger(tile_n);
+    if (key == "tile_k")      return parser.parseInteger(tile_k);
+    if (key == "tasklets")    return parser.parseInteger(tasklets);
     if (key == "active_dpus") return parser.parseInteger(active_dpus);
-    if (key == "alignment")  return parser.parseInteger(alignment);
-    if (key == "group_m")    return parser.parseInteger(group_m);
+    if (key == "alignment")   return parser.parseInteger(alignment);
+    if (key == "group_m")     return parser.parseInteger(group_m);
     if (key == "batch_count") return parser.parseInteger(batch_count);
 
-    // Enum fields – value is a bare keyword
-    std::string val;
+    // Enum fields – value is a bare keyword.
+    StringRef val;
     if (parser.parseKeyword(&val))
       return failure();
 
@@ -141,21 +142,25 @@ Attribute PIMExecutionPlanAttr::parse(AsmParser &parser, Type /*odsType*/) {
     return success();
   };
 
-  if (parser.parseCommaSeparatedList(AsmParser::Delimiter::Less,
-                                     parseKeyValue))
+  // Parse <key = value, ...> manually; Delimiter::Less not available here.
+  if (parser.parseLess())
+    return {};
+  if (parser.parseCommaSeparatedList(parseKeyValue))
+    return {};
+  if (parser.parseGreater())
     return {};
 
-  return PIMExecutionPlanAttr::get(
+  return ExecutionPlanAttr::get(
       parser.getContext(), tile_m, tile_n, tile_k, split_axis, reuse_policy,
       reduction, tasklets, active_dpus, kernel_variant, pack_format,
       accum_type, writeback_mode, alignment, group_m, batch_count);
 }
 
 //===----------------------------------------------------------------------===//
-// PIMMatmulOp – verifier
+// MatmulOp – verifier
 //===----------------------------------------------------------------------===//
 
-LogicalResult PIMMatmulOp::verify() {
+LogicalResult MatmulOp::verify() {
   auto aType = cast<MemRefType>(getA().getType());
   auto bType = cast<MemRefType>(getB().getType());
   auto cType = cast<MemRefType>(getC().getType());

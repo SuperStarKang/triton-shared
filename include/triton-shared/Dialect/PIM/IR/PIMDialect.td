@@ -21,6 +21,7 @@ def PIM_Dialect : Dialect {
     all the information needed to emit a single runtime dispatch call.
   }];
   let useDefaultAttributePrinterParser = 1;
+  let usePropertiesForAttributes = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -110,9 +111,9 @@ def PIM_WritebackMode : I32EnumAttr<"WritebackMode",
 // Attribute Base
 //===----------------------------------------------------------------------===//
 
-class PIM_Attr<string name, string mnemonic, list<Trait> traits = []>
+class PIM_Attr<string name, string _mnemonic, list<Trait> traits = []>
     : AttrDef<PIM_Dialect, name, traits> {
-  let mnemonic = mnemonic;
+  let mnemonic = _mnemonic;
 }
 
 //===----------------------------------------------------------------------===//
