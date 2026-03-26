@@ -48,4 +48,53 @@ def LinalgMatmulToPimCandidate : Pass<"linalg-matmul-to-pim-candidate",
   ];
 }
 
+def PimPlanMaterialize : Pass<"pim-plan-materialize", "mlir::func::FuncOp"> {
+  let summary = "Fill in UNKNOWN fields of pim.matmul execution plans";
+  let description = [{
+    Walks every pim.matmul in a function and replaces any field that is still
+    UNKNOWN (or zero for integer fields) with a concrete value derived from:
+      - element types of the A / C memref operands (→ kernel_variant, accum_type,
+        pack_format)
+      - tile sizes already stored in the plan (tile_m, tile_n, tile_k)
+      - static shapes of the C memref operand (→ active_dpus)
+      - fixed UPMEM hardware defaults (tasklets = 16, alignment = 8,
+        MAX_DPUS = 2560)
+
+    Fields that already carry non-UNKNOWN / non-zero values are left unchanged,
+    so the pass is idempotent and can be used to override individual fields
+    before running it on a partially-filled plan.
+
+    Default decisions:
+      split_axis     = N   (distribute output columns across DPUs)
+      reuse_policy   = REUSE_A (when split along N, A is reused)
+      reduction      = HOST_REDUCE
+      writeback_mode = DIRECT
+      kernel_variant = GROUPED if group_m > 0, otherwise FLAT
+      pack_format    = INT8 for i8 element types, NONE otherwise
+      accum_type     = INT32 for integer outputs, FLOAT32 otherwise
+  }];
+  let constructor = "mlir::triton::createPimPlanMaterializePass()";
+  let dependentDialects = [
+    "mlir::pim::PIMDialect",
+    "mlir::memref::MemRefDialect"
+  ];
+}
+
+def PimLayoutVerify : Pass<"pim-layout-verify", "mlir::func::FuncOp"> {
+  let summary = "Verify pim.matmul execution plans are complete and consistent";
+  let description = [{
+    Walks every pim.matmul in a function and checks that:
+      - no enum field is UNKNOWN
+      - integer fields (tasklets, active_dpus, alignment, tile sizes) are > 0
+      - group_m > 0 implies kernel_variant == GROUPED
+      - split_axis == K implies a non-UNKNOWN reduction strategy
+
+    Emits an error diagnostic and signals pass failure for every violated
+    constraint.  Run this pass after PimPlanMaterialize to catch incomplete
+    or inconsistent plans before lowering to runtime calls.
+  }];
+  let constructor = "mlir::triton::createPimLayoutVerifyPass()";
+  let dependentDialects = ["mlir::pim::PIMDialect"];
+}
+
 #endif // LINALG_MATMUL_TO_PIM_PASSES

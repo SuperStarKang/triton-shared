@@ -20,6 +20,14 @@ createLinalgAnnotateTileMetaPass();
 std::unique_ptr<OperationPass<func::FuncOp>>
 createLinalgMatmulToPimCandidatePass();
 
+/// Fills in UNKNOWN / zero fields of pim.matmul execution plans using element
+/// types, tile sizes, static matrix shapes, and UPMEM hardware defaults.
+std::unique_ptr<OperationPass<func::FuncOp>> createPimPlanMaterializePass();
+
+/// Verifies that every pim.matmul execution plan is complete (no UNKNOWN
+/// fields) and internally consistent.  Signals pass failure on violation.
+std::unique_ptr<OperationPass<func::FuncOp>> createPimLayoutVerifyPass();
+
 } // namespace triton
 } // namespace mlir
 

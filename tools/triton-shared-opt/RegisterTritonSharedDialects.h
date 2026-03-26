@@ -34,7 +34,7 @@ inline void registerTritonSharedDialects(mlir::DialectRegistry &registry) {
   mlir::registerAllPasses();
   mlir::registerLinalgPasses();
   mlir::triton::registerTritonPasses();
-  mlir::triton::registerLinalgMatmulToPimPasses();
+  mlir::triton::registerLinalgMatmulToPimPasses(); // includes PimPlanMaterialize & PimLayoutVerify
   mlir::triton::registerLinalgMatmulToUpmemPass();
   mlir::triton::registerTritonToLinalgPass();
   mlir::triton::registerTritonToLinalgExperimentalPasses();

@@ -1,9 +1,12 @@
 //===----------------------------------------------------------------------===//
-// LinalgAnnotateTileMetaPass  &  LinalgMatmulToPimCandidatePass
+// Stage 2 – LinalgAnnotateTileMetaPass & LinalgMatmulToPimCandidatePass
+// Stage 3 – PimPlanMaterializePass    & PimLayoutVerifyPass
 //
-// Stage 2 of the PIM lowering pipeline:
+// Lowering pipeline for Triton-origin matmuls → pim.matmul:
 //   Pass 1 – annotate every Triton-origin linalg.matmul with static tile sizes
-//   Pass 2 – replace the annotated matmul with a pim.matmul at function entry
+//   Pass 2 – replace the annotated matmul with a pim.matmul (partial plan)
+//   Pass 3 – fill in UNKNOWN plan fields from types / hardware defaults
+//   Pass 4 – verify the completed plan is consistent
 //===----------------------------------------------------------------------===//
 
 #include "triton-shared/Conversion/LinalgMatmulToPim/LinalgMatmulToPim.h"
@@ -344,4 +347,220 @@ struct LinalgMatmulToPimCandidatePass
 std::unique_ptr<OperationPass<func::FuncOp>>
 mlir::triton::createLinalgMatmulToPimCandidatePass() {
   return std::make_unique<LinalgMatmulToPimCandidatePass>();
+}
+
+//===----------------------------------------------------------------------===//
+// Pass 3: PimPlanMaterializePass
+//
+// Fills in every UNKNOWN / zero field of a pim.matmul execution plan.
+// Fields that already carry concrete values are left untouched (idempotent).
+//
+// Heuristics (all overridable by pre-filling the plan before this pass):
+//   split_axis     = N        (distribute output columns across DPUs)
+//   reuse_policy   = REUSE_A  (A is reused; each DPU holds a tile of B)
+//   reduction      = HOST_REDUCE
+//   writeback_mode = DIRECT
+//   kernel_variant = GROUPED if group_m > 0, else FLAT
+//   pack_format    = INT8 for i8 inputs, NONE otherwise
+//   accum_type     = INT32 for integer outputs, FLOAT32 otherwise
+//   tasklets       = 16       (safe default for all UPMEM DPU generations)
+//   active_dpus    = ceil(M/tile_m)*ceil(N/tile_n) capped at 2560, or 2560
+//                   when the matrix shapes are dynamic
+//   alignment      = 8        (minimum DPU transfer alignment in bytes)
+//===----------------------------------------------------------------------===//
+
+namespace {
+struct PimPlanMaterializePass
+    : public PimPlanMaterializeBase<PimPlanMaterializePass> {
+
+  void runOnOperation() override {
+    func::FuncOp func = getOperation();
+
+    // Collect (op, newPlan) pairs first; mutate after the walk.
+    SmallVector<std::pair<pim::MatmulOp, pim::ExecutionPlanAttr>> toUpdate;
+
+    func.walk([&](pim::MatmulOp matmul) {
+      pim::ExecutionPlanAttr plan = matmul.getPlan();
+
+      // ----------------------------------------------------------------
+      // Derive element-type-dependent fields.
+      // ----------------------------------------------------------------
+      auto aType = cast<MemRefType>(matmul.getA().getType());
+      auto cType = cast<MemRefType>(matmul.getC().getType());
+      Type aElem  = aType.getElementType();
+      Type cElem  = cType.getElementType();
+
+      // KernelVariant
+      pim::KernelVariant kv = plan.getKernelVariant();
+      if (kv == pim::KernelVariant::UNKNOWN)
+        kv = (plan.getGroupM() > 0) ? pim::KernelVariant::GROUPED
+                                    : pim::KernelVariant::FLAT;
+
+      // PackFormat
+      pim::PackFormat pf = plan.getPackFormat();
+      if (pf == pim::PackFormat::UNKNOWN)
+        pf = aElem.isInteger(8) ? pim::PackFormat::INT8
+                                : pim::PackFormat::NONE;
+
+      // AccumType
+      pim::AccumType at = plan.getAccumType();
+      if (at == pim::AccumType::UNKNOWN)
+        at = (cElem.isInteger(32) || cElem.isInteger(8))
+                 ? pim::AccumType::INT32
+                 : pim::AccumType::FLOAT32;
+
+      // ----------------------------------------------------------------
+      // Derive layout / distribution fields.
+      // ----------------------------------------------------------------
+      pim::SplitAxis sa = plan.getSplitAxis();
+      if (sa == pim::SplitAxis::UNKNOWN)
+        sa = pim::SplitAxis::N;
+
+      pim::ReusePolicy rp = plan.getReusePolicy();
+      if (rp == pim::ReusePolicy::UNKNOWN)
+        rp = (sa == pim::SplitAxis::N) ? pim::ReusePolicy::REUSE_A
+                                       : pim::ReusePolicy::REUSE_B;
+
+      pim::ReductionStrategy rs = plan.getReduction();
+      if (rs == pim::ReductionStrategy::UNKNOWN)
+        rs = pim::ReductionStrategy::HOST_REDUCE;
+
+      pim::WritebackMode wm = plan.getWritebackMode();
+      if (wm == pim::WritebackMode::UNKNOWN)
+        wm = pim::WritebackMode::DIRECT;
+
+      // ----------------------------------------------------------------
+      // Compute active_dpus from static C-matrix dimensions.
+      // ----------------------------------------------------------------
+      constexpr int32_t kMaxDpus = 2560;
+      int32_t activeDpus = plan.getActiveDpus();
+      if (activeDpus == 0) {
+        int64_t staticM = cType.getShape()[0];
+        int64_t staticN = cType.getShape()[1];
+        int64_t tileM   = plan.getTileM();
+        int64_t tileN   = plan.getTileN();
+        if (staticM != ShapedType::kDynamic && staticN != ShapedType::kDynamic
+            && tileM > 0 && tileN > 0) {
+          int64_t dpuM   = (staticM + tileM - 1) / tileM;
+          int64_t dpuN   = (staticN + tileN - 1) / tileN;
+          int64_t needed = dpuM * dpuN;
+          activeDpus = static_cast<int32_t>(needed < kMaxDpus ? needed : kMaxDpus);
+        } else {
+          activeDpus = kMaxDpus;
+        }
+      }
+
+      // ----------------------------------------------------------------
+      // Fixed hardware defaults.
+      // ----------------------------------------------------------------
+      int32_t tasklets   = plan.getTasklets()   > 0 ? plan.getTasklets()   : 16;
+      int32_t alignment  = plan.getAlignment()  > 0 ? plan.getAlignment()  : 8;
+      int32_t groupM     = plan.getGroupM();
+      int32_t batchCount = plan.getBatchCount() > 0 ? plan.getBatchCount() : 1;
+
+      pim::ExecutionPlanAttr newPlan = pim::ExecutionPlanAttr::get(
+          func.getContext(),
+          plan.getTileM(), plan.getTileN(), plan.getTileK(),
+          sa, rp, rs,
+          tasklets, activeDpus,
+          kv, pf, at, wm,
+          alignment, groupM, batchCount);
+
+      toUpdate.emplace_back(matmul, newPlan);
+
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[pim-plan-materialize] " << func.getName()
+                 << ": materialized plan (split=" << (int)sa
+                 << " dpus=" << activeDpus << ")\n");
+    });
+
+    // Replace each matmul with a new one carrying the materialized plan.
+    for (auto &[matmul, newPlan] : toUpdate) {
+      OpBuilder b(matmul);
+      b.create<pim::MatmulOp>(matmul.getLoc(),
+                               matmul.getA(), matmul.getB(), matmul.getC(),
+                               matmul.getMSize(), matmul.getNSize(),
+                               matmul.getKSize(), newPlan);
+      matmul.erase();
+    }
+  }
+};
+} // namespace
+
+std::unique_ptr<OperationPass<func::FuncOp>>
+mlir::triton::createPimPlanMaterializePass() {
+  return std::make_unique<PimPlanMaterializePass>();
+}
+
+//===----------------------------------------------------------------------===//
+// Pass 4: PimLayoutVerifyPass
+//
+// Verifies that every pim.matmul execution plan is complete and consistent.
+// Emits error diagnostics and signals pass failure for each violated constraint.
+//
+// Checked constraints:
+//   1. All enum fields (split_axis, reuse_policy, reduction, kernel_variant,
+//      pack_format, accum_type, writeback_mode) must be non-UNKNOWN.
+//   2. Integer fields (tasklets, active_dpus, alignment, tile_m/n/k) must be > 0.
+//   3. group_m > 0 → kernel_variant must be GROUPED.
+//   4. split_axis == K → reduction must not be UNKNOWN.
+//===----------------------------------------------------------------------===//
+
+namespace {
+struct PimLayoutVerifyPass
+    : public PimLayoutVerifyBase<PimLayoutVerifyPass> {
+
+  void runOnOperation() override {
+    func::FuncOp func = getOperation();
+    bool failed = false;
+
+    func.walk([&](pim::MatmulOp matmul) {
+      pim::ExecutionPlanAttr p = matmul.getPlan();
+
+      auto err = [&](StringRef msg) {
+        matmul.emitError(msg);
+        failed = true;
+      };
+
+      // ---- enum fields must be non-UNKNOWN --------------------------------
+      if (p.getSplitAxis()    == pim::SplitAxis::UNKNOWN)
+        err("pim.matmul plan has UNKNOWN split_axis");
+      if (p.getReusePolicy()  == pim::ReusePolicy::UNKNOWN)
+        err("pim.matmul plan has UNKNOWN reuse_policy");
+      if (p.getReduction()    == pim::ReductionStrategy::UNKNOWN)
+        err("pim.matmul plan has UNKNOWN reduction");
+      if (p.getKernelVariant()== pim::KernelVariant::UNKNOWN)
+        err("pim.matmul plan has UNKNOWN kernel_variant");
+      if (p.getPackFormat()   == pim::PackFormat::UNKNOWN)
+        err("pim.matmul plan has UNKNOWN pack_format");
+      if (p.getAccumType()    == pim::AccumType::UNKNOWN)
+        err("pim.matmul plan has UNKNOWN accum_type");
+      if (p.getWritebackMode()== pim::WritebackMode::UNKNOWN)
+        err("pim.matmul plan has UNKNOWN writeback_mode");
+
+      // ---- integer fields must be positive --------------------------------
+      if (p.getTasklets()  <= 0) err("pim.matmul plan: tasklets must be > 0");
+      if (p.getActiveDpus()<= 0) err("pim.matmul plan: active_dpus must be > 0");
+      if (p.getAlignment() <= 0) err("pim.matmul plan: alignment must be > 0");
+      if (p.getTileM() <= 0 || p.getTileN() <= 0 || p.getTileK() <= 0)
+        err("pim.matmul plan: tile_m/n/k must all be > 0");
+
+      // ---- consistency checks --------------------------------------------
+      if (p.getGroupM() > 0 && p.getKernelVariant() != pim::KernelVariant::GROUPED)
+        err("pim.matmul plan: group_m > 0 but kernel_variant is not GROUPED");
+
+      if (p.getSplitAxis() == pim::SplitAxis::K &&
+          p.getReduction() == pim::ReductionStrategy::UNKNOWN)
+        err("pim.matmul plan: split_axis=K requires a non-UNKNOWN reduction");
+    });
+
+    if (failed)
+      signalPassFailure();
+  }
+};
+} // namespace
+
+std::unique_ptr<OperationPass<func::FuncOp>>
+mlir::triton::createPimLayoutVerifyPass() {
+  return std::make_unique<PimLayoutVerifyPass>();
 }
