@@ -1182,10 +1182,11 @@ struct MatmulConverter : public OpConversionPattern<triton::DotOp> {
         rewriter.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{init})
             .result();
 
-    auto res = rewriter
-                   .create<linalg::MatmulOp>(loc, ValueRange{opa, opb},
-                                             ValueRange{zeroes})
-                   .getResult(0);
+    auto matmulOp = rewriter.create<linalg::MatmulOp>(loc, ValueRange{opa, opb},
+                                                       ValueRange{zeroes});
+    // Mark as Triton-origin so PIM passes can identify and replace this op.
+    matmulOp->setAttr("triton.dot_origin", rewriter.getUnitAttr());
+    auto res = matmulOp.getResult(0);
 
     if (!skipC) {
       if (integers) {

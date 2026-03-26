@@ -12,6 +12,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 
+#include "triton-shared/Conversion/LinalgMatmulToPim/Passes.h"
 #include "triton-shared/Conversion/LinalgMatmulToUpmem/Passes.h"
 #include "triton-shared/Conversion/StructuredToMemref/Passes.h"
 #include "triton-shared/Conversion/TritonArithToLinalg/Passes.h"
@@ -33,6 +34,7 @@ inline void registerTritonSharedDialects(mlir::DialectRegistry &registry) {
   mlir::registerAllPasses();
   mlir::registerLinalgPasses();
   mlir::triton::registerTritonPasses();
+  mlir::triton::registerLinalgMatmulToPimPasses();
   mlir::triton::registerLinalgMatmulToUpmemPass();
   mlir::triton::registerTritonToLinalgPass();
   mlir::triton::registerTritonToLinalgExperimentalPasses();
