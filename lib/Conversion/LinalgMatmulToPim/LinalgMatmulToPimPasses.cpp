@@ -21,7 +21,8 @@
 #include "mlir/Pass/Pass.h"
 
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/SmallDenseSet.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "linalg-matmul-to-pim"
@@ -81,7 +82,7 @@ static BlockArgument traceToFuncArg(Value val) {
             [&](auto op) { worklist.push_back(op.getSource()); })
         .Case<memref::ReinterpretCastOp>(
             [&](auto op) { worklist.push_back(op.getSource()); })
-        .Case<bufferization::ToMemrefOp>(
+        .Case<bufferization::ToBufferOp>(
             [&](auto op) { worklist.push_back(op.getTensor()); })
         .Case<tensor::ExtractSliceOp>(
             [&](auto op) { worklist.push_back(op.getSource()); })

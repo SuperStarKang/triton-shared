@@ -1,6 +1,7 @@
 #ifndef TRITON_CONVERSION_LINALGMATMULTOPIM_H
 #define TRITON_CONVERSION_LINALGMATMULTOPIM_H
 
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 
