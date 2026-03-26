@@ -71,6 +71,11 @@ def _use_pim_ir() -> bool:
     return os.getenv("TRITON_USE_PIM", "").lower() in ("1", "true", "on", "yes", "y")
 
 
+def _use_pim_mlir() -> bool:
+    """True when both TRITON_USE_PIM and TRITON_PIM_MLIR are set."""
+    return _use_pim_ir() and os.getenv("TRITON_PIM_MLIR", "").lower() in ("1", "true", "on", "yes", "y")
+
+
 # Pattern to extract upmem.* attributes emitted by --linalg-matmul-to-upmem.
 # After the pass, the function looks like:
 #   func.func @kernel(...) attributes { upmem.bm = 32 : i32, ... } { ... }
@@ -156,6 +161,46 @@ def _ttsharedir_to_pimir(ttsharedir: str, metadata: dict) -> str:
 
     metadata["pim_meta"] = pim_meta
     return _ttsharedir_to_llir(ttsharedir)
+
+
+def _ttsharedir_to_pim_mlir_and_llir(ttsharedir: str, metadata: dict) -> str:
+    """Run the 5-pass PIM-MLIR pipeline, then lower to LLVM IR.
+
+    Passes (run via triton-shared-opt):
+      1. linalg-annotate-tile-meta
+      2. linalg-matmul-to-pim-candidate
+      3. canonicalize
+      4. pim-plan-materialize
+      5. pim-layout-verify
+      6. pim-to-runtime-calls   ← replaces pim.matmul with triton_pim_matmul call
+
+    The output is then lowered to LLVM IR via the standard _ttsharedir_to_llir path.
+    The compiled kernel calls triton_pim_matmul() once; the launcher stub provides
+    the implementation (see _pim_runtime_stub in driver.py).
+    """
+    tso_path = _get_triton_shared_opt_path()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        src = os.path.join(tmpdir, "ttshared.mlir")
+        dst = os.path.join(tmpdir, "pim_lowered.mlir")
+        Path(src).write_text(ttsharedir)
+        subprocess.check_call([
+            tso_path, src,
+            "--linalg-annotate-tile-meta",
+            "--linalg-matmul-to-pim-candidate",
+            "--canonicalize",
+            "--pim-plan-materialize",
+            "--pim-layout-verify",
+            "--pim-to-runtime-calls",
+            "-o", dst,
+        ])
+        pim_ir = Path(dst).read_text()
+
+        dump_dir = os.getenv("TRITON_SHARED_DUMP_PATH")
+        if dump_dir:
+            Path(os.path.join(dump_dir, "pim_lowered.mlir")).write_text(pim_ir)
+
+    metadata["pim_meta"] = {"pim_mlir_dispatch": True}
+    return _ttsharedir_to_llir(pim_ir)
 
 
 def _optimize_ttsharedir(ttsharedir: str):
@@ -318,15 +363,17 @@ class CPUBackend(BaseBackend):
         # used in the launch function in driver.py. Putting these in so we're
         # consistent with other backends
         pim_meta = metadata.pim_meta if hasattr(metadata, "pim_meta") else None
+        pim_mlir_dispatch = bool(pim_meta and pim_meta.get("pim_mlir_dispatch", False))
         return (
-            metadata.num_warps,
-            metadata.num_ctas,
-            metadata.shared,
-            metadata.cluster_dims[0],
-            metadata.cluster_dims[1],
-            metadata.cluster_dims[2],
-            metadata.name,
-            pim_meta,
+            metadata.num_warps,      # [0]
+            metadata.num_ctas,       # [1]
+            metadata.shared,         # [2]
+            metadata.cluster_dims[0], # [3]
+            metadata.cluster_dims[1], # [4]
+            metadata.cluster_dims[2], # [5]
+            metadata.name,           # [6]
+            pim_meta,                # [7]
+            pim_mlir_dispatch,       # [8] True → MLIR-lowered pim.matmul, call with grid(1,1,1)
         )
 
     # Our compilation pipeline isn't in python like nvidia or amd, no need to load
@@ -355,7 +402,9 @@ class CPUBackend(BaseBackend):
     def add_stages(self, stages, options, language):
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
         stages["ttsharedir"] = lambda src, metadata: _optimize_ttsharedir(_ttir_to_ttsharedir(src))
-        if _use_pim_ir():
+        if _use_pim_mlir():
+            stages["llir"] = lambda src, metadata: _optimize_llir(_ttsharedir_to_pim_mlir_and_llir(src, metadata))
+        elif _use_pim_ir():
             stages["llir"] = lambda src, metadata: _optimize_llir(_ttsharedir_to_pimir(src, metadata))
         else:
             stages["llir"] = lambda src, metadata: _optimize_llir(_ttsharedir_to_llir(src))

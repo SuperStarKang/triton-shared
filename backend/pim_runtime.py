@@ -106,3 +106,36 @@ def pim_launch(
     if ret != 0:
         raise RuntimeError(f"triton_pim_kernel_launch failed: {ret}")
     return stats
+
+
+def triton_pim_matmul_mlir(
+    a_ptr, b_ptr, c_ptr,
+    m, n, k,
+    tile_m, tile_n, tile_k,
+    active_dpus,
+    dpu_binary_path=None,
+):
+    """Python-level proxy for the triton_pim_matmul C stub (for testing).
+
+    Mirrors the call that the MLIR-lowered kernel makes to triton_pim_matmul,
+    translating the flat args into triton_pim_kernel_launch() directly via ctypes.
+    """
+    if dpu_binary_path is None:
+        dpu_binary_path = os.getenv(
+            "TRITON_PIM_DPU_BINARY",
+            "/home/dlrkdals/PGEMMlib/PGEMMLib_With_AutoTuner/dpu/gemm_dpu_triton",
+        )
+    grid_m = (m + tile_m - 1) // tile_m
+    grid_n = (n + tile_n - 1) // tile_n
+    return pim_launch(
+        a_ptr, b_ptr, c_ptr,
+        m, k, n,              # note: K before N in the underlying ABI
+        tile_m, tile_k, tile_n,
+        nr_of_dpus=1,
+        transb=0,
+        schedule_policy=1,    # global_tile_static
+        dpu_binary_path=dpu_binary_path,
+        grid_m=grid_m,
+        grid_n=grid_n,
+        forced_active_dpus=active_dpus,
+    )
