@@ -195,11 +195,34 @@ def _ttsharedir_to_pim_mlir_and_llir(ttsharedir: str, metadata: dict) -> str:
         ])
         pim_ir = Path(dst).read_text()
 
-        dump_dir = os.getenv("TRITON_SHARED_DUMP_PATH")
-        if dump_dir:
-            Path(os.path.join(dump_dir, "pim_lowered.mlir")).write_text(pim_ir)
+    # Only dispatch via PIM-MLIR if the pipeline actually produced a call.
+    # If no pim.matmul was matched (pattern miss or pass not built), fall back
+    # to normal CPU execution — do NOT override the grid in that case.
+    pim_converted = "triton_pim_matmul" in pim_ir
 
-    metadata["pim_meta"] = {"pim_mlir_dispatch": True}
+    dump_dir = os.getenv("TRITON_SHARED_DUMP_PATH")
+    if dump_dir:
+        if pim_converted:
+            # Preserve the last successful PIM dump so _check_dump() is useful.
+            Path(os.path.join(dump_dir, "pim_lowered.mlir")).write_text(pim_ir)
+        else:
+            # Write fallback IR to a separate file; don't overwrite the
+            # last successful pim_lowered.mlir.
+            Path(os.path.join(dump_dir, "pim_lowered_fallback.mlir")).write_text(pim_ir)
+    # Set pim_meta only when the pipeline actually produced a triton_pim_matmul call.
+    # None → driver.py's _launch_pim branch is skipped entirely (CPU fallback).
+    if pim_converted:
+        metadata["pim_meta"] = {"pim_mlir_dispatch": True}
+    else:
+        metadata["pim_meta"] = None
+        import warnings
+        warnings.warn(
+            "[PIM-MLIR] no pim.matmul converted in kernel — "
+            "falling back to CPU execution.  "
+            "Check that triton-shared-opt has the new passes and that "
+            "the kernel contains a single tl.dot.",
+            stacklevel=2,
+        )
     return _ttsharedir_to_llir(pim_ir)
 
 

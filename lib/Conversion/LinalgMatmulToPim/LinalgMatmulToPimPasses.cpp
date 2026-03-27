@@ -12,6 +12,7 @@
 #include "triton-shared/Conversion/LinalgMatmulToPim/LinalgMatmulToPim.h"
 #include "triton-shared/Dialect/PIM/IR/PIMDialect.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -252,10 +253,48 @@ struct LinalgMatmulToPimCandidatePass
     }
 
     // ----------------------------------------------------------------
+    // Step 2b: gate on i8 inputs — the UPMEM DPU runtime only supports
+    // integer (int8) matrix multiply.  Skip f32 / f16 / bf16 kernels so
+    // that they fall back to the normal CPU path without NaN corruption.
+    // ----------------------------------------------------------------
+    {
+      auto getInputElemType = [](Value v) -> Type {
+        Type t = v.getType();
+        if (auto mr = dyn_cast<MemRefType>(t)) return mr.getElementType();
+        if (auto tt = dyn_cast<TensorType>(t)) return tt.getElementType();
+        return {};
+      };
+      Type aElem = getInputElemType(matmul.getInputs()[0]);
+      if (!aElem || !aElem.isInteger(8)) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[linalg-matmul-to-pim-candidate] " << func.getName()
+                   << ": input element type is not i8 ("
+                   << (aElem ? "" : "unknown") << "), skipping\n");
+        return;
+      }
+    }
+
+    // ----------------------------------------------------------------
     // Step 3: trace matmul inputs to full-matrix function arguments.
+    // SSA tracing may fail when tile loading uses alloc+copy pattern
+    // (to_tensor(%alloc) ← memref.copy ← reinterpret_cast(%arg0)).
+    // Fall back to NameLoc search in that case.
     // ----------------------------------------------------------------
     BlockArgument fullA = traceToFuncArg(matmul.getInputs()[0]);
     BlockArgument fullB = traceToFuncArg(matmul.getInputs()[1]);
+
+    if (!fullA) {
+      for (BlockArgument arg : func.getArguments()) {
+        StringRef n = getArgName(arg);
+        if (n == "a_ptr" || n == "a" || n == "A") { fullA = arg; break; }
+      }
+    }
+    if (!fullB) {
+      for (BlockArgument arg : func.getArguments()) {
+        StringRef n = getArgName(arg);
+        if (n == "b_ptr" || n == "b" || n == "B") { fullB = arg; break; }
+      }
+    }
 
     // ----------------------------------------------------------------
     // Step 4: find full C.
@@ -292,9 +331,10 @@ struct LinalgMatmulToPimCandidatePass
       return;
     }
 
-    // Verify the resolved args are actually 2-D MemRefs.
+    // Verify the resolved args are MemRefs (ranked or unranked).
     auto checkMemRef = [&](BlockArgument arg, StringRef label) -> bool {
-      if (!isa<MemRefType>(arg.getType())) {
+      if (!isa<MemRefType>(arg.getType()) &&
+          !isa<UnrankedMemRefType>(arg.getType())) {
         LLVM_DEBUG(llvm::dbgs()
                    << "[linalg-matmul-to-pim-candidate] " << label
                    << " is not a memref type, skipping\n");
@@ -312,10 +352,29 @@ struct LinalgMatmulToPimCandidatePass
     Location loc = matmul.getLoc();
     OpBuilder builder(&func.getBody().front().front());
 
-    // Dynamic M, N, K from the full matrix dimensions.
-    Value M = builder.create<memref::DimOp>(loc, fullC, 0);
-    Value N = builder.create<memref::DimOp>(loc, fullC, 1);
-    Value K = builder.create<memref::DimOp>(loc, fullA, 1);
+    // Prefer the Triton integer kernel arguments M, N, K (i32) over DimOp on
+    // unranked memrefs, which can cause issues during LLVM lowering.
+    auto findIntArg = [&](StringRef name) -> Value {
+      for (BlockArgument arg : func.getArguments()) {
+        if (getArgName(arg) == name && arg.getType().isInteger())
+          return arg;
+      }
+      return Value();
+    };
+    Value dynM = findIntArg("M"), dynN = findIntArg("N"),
+          dynK = findIntArg("K");
+
+    auto idxType = builder.getIndexType();
+    Value M, N, K;
+    if (dynM && dynN && dynK) {
+      M = builder.create<arith::IndexCastOp>(loc, idxType, dynM);
+      N = builder.create<arith::IndexCastOp>(loc, idxType, dynN);
+      K = builder.create<arith::IndexCastOp>(loc, idxType, dynK);
+    } else {
+      M = builder.create<memref::DimOp>(loc, fullC, 0);
+      N = builder.create<memref::DimOp>(loc, fullC, 1);
+      K = builder.create<memref::DimOp>(loc, fullA, 1);
+    }
 
     // Partial plan: tile sizes filled in, everything else UNKNOWN/0.
     auto plan = pim::ExecutionPlanAttr::get(
@@ -336,10 +395,20 @@ struct LinalgMatmulToPimCandidatePass
                << " bk=" << bk << ")\n");
 
     // ----------------------------------------------------------------
-    // Step 6: erase the linalg.matmul.  Dead subviews / loops are cleaned
-    //         by a subsequent canonicalize pass.
+    // Step 6: intentionally keep the linalg.matmul in the IR.
+    //
+    // Erasing it while the linalg.generic accumulation op still holds a
+    // reference to the matmul's tensor result causes a use-after-free that
+    // manifests as SIGSEGV inside --canonicalize's verifier
+    // (hasPureTensorSemantics iterates freed operand Values).
+    //
+    // With the matmul intact the execution model is:
+    //   • pim.matmul  – computes the full M×N result into fullC (c_ptr)
+    //   • original for-loop – runs for pid_m=0, pid_n=0 (grid overridden to
+    //     (1,1,1)); computes the first BM×BN tile and tl.stores it to
+    //     c_ptr[0:BM, 0:BN] — identical to the pim.matmul result there.
+    // Final c_ptr is correct everywhere.
     // ----------------------------------------------------------------
-    matmul.erase();
   }
 };
 } // namespace
@@ -384,11 +453,17 @@ struct PimPlanMaterializePass
 
       // ----------------------------------------------------------------
       // Derive element-type-dependent fields.
+      // Handles both ranked MemRefType and UnrankedMemRefType.
       // ----------------------------------------------------------------
-      auto aType = cast<MemRefType>(matmul.getA().getType());
-      auto cType = cast<MemRefType>(matmul.getC().getType());
-      Type aElem  = aType.getElementType();
-      Type cElem  = cType.getElementType();
+      auto getElemType = [](Type t) -> Type {
+        if (auto mr = dyn_cast<MemRefType>(t))
+          return mr.getElementType();
+        if (auto umr = dyn_cast<UnrankedMemRefType>(t))
+          return umr.getElementType();
+        return {};
+      };
+      Type aElem = getElemType(matmul.getA().getType());
+      Type cElem = getElemType(matmul.getC().getType());
 
       // KernelVariant
       pim::KernelVariant kv = plan.getKernelVariant();
@@ -421,8 +496,10 @@ struct PimPlanMaterializePass
         rp = (sa == pim::SplitAxis::N) ? pim::ReusePolicy::REUSE_A
                                        : pim::ReusePolicy::REUSE_B;
 
+      // Reduction is only meaningful for K-split; non-K splits must leave it
+      // UNKNOWN (the verifier enforces this as a consistency constraint).
       pim::ReductionStrategy rs = plan.getReduction();
-      if (rs == pim::ReductionStrategy::UNKNOWN)
+      if (rs == pim::ReductionStrategy::UNKNOWN && sa == pim::SplitAxis::K)
         rs = pim::ReductionStrategy::HOST_REDUCE;
 
       pim::WritebackMode wm = plan.getWritebackMode();
@@ -435,8 +512,14 @@ struct PimPlanMaterializePass
       constexpr int32_t kMaxDpus = 2560;
       int32_t activeDpus = plan.getActiveDpus();
       if (activeDpus == 0) {
-        int64_t staticM = cType.getShape()[0];
-        int64_t staticN = cType.getShape()[1];
+        // Static shape is only available for ranked memrefs.
+        auto cRanked = dyn_cast<MemRefType>(matmul.getC().getType());
+        int64_t staticM = (cRanked && cRanked.getRank() >= 1)
+                              ? cRanked.getShape()[0]
+                              : ShapedType::kDynamic;
+        int64_t staticN = (cRanked && cRanked.getRank() >= 2)
+                              ? cRanked.getShape()[1]
+                              : ShapedType::kDynamic;
         int64_t tileM   = plan.getTileM();
         int64_t tileN   = plan.getTileN();
         if (staticM != ShapedType::kDynamic && staticN != ShapedType::kDynamic
@@ -523,12 +606,11 @@ struct PimLayoutVerifyPass
       };
 
       // ---- enum fields must be non-UNKNOWN --------------------------------
+      // (reduction is exempt: it must be UNKNOWN for non-K splits — see below)
       if (p.getSplitAxis()    == pim::SplitAxis::UNKNOWN)
         err("pim.matmul plan has UNKNOWN split_axis");
       if (p.getReusePolicy()  == pim::ReusePolicy::UNKNOWN)
         err("pim.matmul plan has UNKNOWN reuse_policy");
-      if (p.getReduction()    == pim::ReductionStrategy::UNKNOWN)
-        err("pim.matmul plan has UNKNOWN reduction");
       if (p.getKernelVariant()== pim::KernelVariant::UNKNOWN)
         err("pim.matmul plan has UNKNOWN kernel_variant");
       if (p.getPackFormat()   == pim::PackFormat::UNKNOWN)
@@ -549,9 +631,14 @@ struct PimLayoutVerifyPass
       if (p.getGroupM() > 0 && p.getKernelVariant() != pim::KernelVariant::GROUPED)
         err("pim.matmul plan: group_m > 0 but kernel_variant is not GROUPED");
 
+      // K-split requires a concrete reduction; non-K splits must leave it UNKNOWN.
       if (p.getSplitAxis() == pim::SplitAxis::K &&
           p.getReduction() == pim::ReductionStrategy::UNKNOWN)
         err("pim.matmul plan: split_axis=K requires a non-UNKNOWN reduction");
+      if (p.getSplitAxis() != pim::SplitAxis::K &&
+          p.getSplitAxis() != pim::SplitAxis::UNKNOWN &&
+          p.getReduction() != pim::ReductionStrategy::UNKNOWN)
+        err("pim.matmul plan: reduction must be UNKNOWN for non-K split axis");
     });
 
     if (failed)

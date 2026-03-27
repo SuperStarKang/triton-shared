@@ -13,7 +13,6 @@ Flow inside _launch_pim():
 """
 
 import json
-import math
 import os
 from pathlib import Path
 
@@ -65,17 +64,21 @@ def _save_disk_cache(m: int, n: int, k: int, data: dict) -> None:
 # Sweep helpers
 # ---------------------------------------------------------------------------
 
+_MIN_ACTIVE_DPUS = 256  # never sweep below this value
+
 def _dpu_candidates(ndpu: int, total_tiles: int) -> list:
-    """Generate active_dpus candidates by halving from max down to 1."""
+    """Generate active_dpus candidates by halving from max down to _MIN_ACTIVE_DPUS."""
     max_v = min(ndpu, total_tiles)
     candidates = []
     v = max_v
-    while v >= 1:
+    while v >= _MIN_ACTIVE_DPUS:
         candidates.append(v)
         v //= 2
-    if not candidates or candidates[-1] != 1:
-        candidates.append(1)
-    return candidates
+    # Always include _MIN_ACTIVE_DPUS itself as the floor candidate.
+    if not candidates or candidates[-1] != _MIN_ACTIVE_DPUS:
+        if _MIN_ACTIVE_DPUS <= max_v:
+            candidates.append(_MIN_ACTIVE_DPUS)
+    return candidates if candidates else [max(max_v, 1)]
 
 
 def _sweep(m, n, k, bm, bk, bn, ndpu, transb, schedule_policy, dpu_binary,

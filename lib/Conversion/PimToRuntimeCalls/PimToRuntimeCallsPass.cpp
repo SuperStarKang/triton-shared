@@ -111,10 +111,19 @@ struct PimToRuntimeCallsPass
 
       // ------------------------------------------------------------------
       // Extract aligned pointers from A, B, C memrefs → i64.
+      // ExtractAlignedPointerAsIndexOp requires ranked memref; cast
+      // UnrankedMemRefType to memref<?x?xT> first.
       // ------------------------------------------------------------------
-      auto extractPtr = [&](Value memref) -> Value {
+      auto extractPtr = [&](Value memrefVal) -> Value {
+        Value ranked = memrefVal;
+        if (auto umr = dyn_cast<UnrankedMemRefType>(memrefVal.getType())) {
+          auto dynType = MemRefType::get(
+              {ShapedType::kDynamic, ShapedType::kDynamic},
+              umr.getElementType());
+          ranked = b.create<memref::CastOp>(loc, dynType, memrefVal);
+        }
         Value idx = b.create<memref::ExtractAlignedPointerAsIndexOp>(
-            loc, memref);
+            loc, ranked);
         return b.create<arith::IndexCastUIOp>(loc, i64, idx);
       };
       Value ptrA = extractPtr(matmul.getA());

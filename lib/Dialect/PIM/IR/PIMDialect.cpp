@@ -161,18 +161,28 @@ Attribute ExecutionPlanAttr::parse(AsmParser &parser, Type /*odsType*/) {
 //===----------------------------------------------------------------------===//
 
 LogicalResult MatmulOp::verify() {
-  auto aType = cast<MemRefType>(getA().getType());
-  auto bType = cast<MemRefType>(getB().getType());
-  auto cType = cast<MemRefType>(getC().getType());
+  // Rank checks only apply to ranked memrefs; unranked memrefs are accepted
+  // as-is (rank is dynamic and will be validated at runtime).
+  auto aRanked = dyn_cast<MemRefType>(getA().getType());
+  auto bRanked = dyn_cast<MemRefType>(getB().getType());
+  auto cRanked = dyn_cast<MemRefType>(getC().getType());
 
-  if (aType.getRank() != 2)
+  if (aRanked && aRanked.getRank() != 2)
     return emitOpError("operand 'a' must be a rank-2 memref");
-  if (bType.getRank() != 2)
+  if (bRanked && bRanked.getRank() != 2)
     return emitOpError("operand 'b' must be a rank-2 memref");
-  if (cType.getRank() != 2)
+  if (cRanked && cRanked.getRank() != 2)
     return emitOpError("operand 'c' must be a rank-2 memref");
 
-  if (aType.getElementType() != bType.getElementType())
+  // Element type check: only possible when both sides are ranked.
+  auto getElem = [](Type t) -> Type {
+    if (auto mr = dyn_cast<MemRefType>(t)) return mr.getElementType();
+    if (auto umr = dyn_cast<UnrankedMemRefType>(t)) return umr.getElementType();
+    return {};
+  };
+  Type aElem = getElem(getA().getType());
+  Type bElem = getElem(getB().getType());
+  if (aElem && bElem && aElem != bElem)
     return emitOpError("operands 'a' and 'b' must have the same element type");
 
   auto plan = getPlan();

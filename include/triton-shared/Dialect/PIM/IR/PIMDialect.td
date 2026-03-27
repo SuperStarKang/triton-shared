@@ -203,9 +203,9 @@ def PIM_MatmulOp : PIM_Op<"matmul", [
   }];
 
   let arguments = (ins
-    AnyMemRef:$a,
-    AnyMemRef:$b,
-    AnyMemRef:$c,
+    AnyTypeOf<[AnyMemRef, AnyUnrankedMemRef]>:$a,
+    AnyTypeOf<[AnyMemRef, AnyUnrankedMemRef]>:$b,
+    AnyTypeOf<[AnyMemRef, AnyUnrankedMemRef]>:$c,
     Index:$m_size,
     Index:$n_size,
     Index:$k_size,
