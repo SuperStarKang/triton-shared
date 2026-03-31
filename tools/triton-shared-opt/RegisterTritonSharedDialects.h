@@ -14,7 +14,6 @@
 
 #include "triton-shared/Conversion/LinalgMatmulToPim/Passes.h"
 #include "triton-shared/Conversion/PimToRuntimeCalls/Passes.h"
-#include "triton-shared/Conversion/LinalgMatmulToUpmem/Passes.h"
 #include "triton-shared/Conversion/StructuredToMemref/Passes.h"
 #include "triton-shared/Conversion/TritonArithToLinalg/Passes.h"
 #include "triton-shared/Conversion/TritonPtrToMemref/Passes.h"
@@ -37,7 +36,6 @@ inline void registerTritonSharedDialects(mlir::DialectRegistry &registry) {
   mlir::triton::registerTritonPasses();
   mlir::triton::registerLinalgMatmulToPimPasses(); // includes PimPlanMaterialize & PimLayoutVerify
   mlir::triton::registerPimToRuntimeCallsPasses();
-  mlir::triton::registerLinalgMatmulToUpmemPass();
   mlir::triton::registerTritonToLinalgPass();
   mlir::triton::registerTritonToLinalgExperimentalPasses();
   mlir::triton::registerTritonToStructuredPass();

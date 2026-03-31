@@ -1,17 +1,10 @@
 import hashlib
 import tempfile
 import sysconfig
-import threading
 
 import os, subprocess, tempfile, platform
 import importlib.util
 import sys
-
-# Thread-local storage for PIM timing reported by pim_runtime.
-# _launch_pim() writes stats.total_ms here after each launch so that
-# CPUDriver.get_benchmarker() can return accurate PIM-internal timings
-# instead of Python wall-clock measurements.
-_pim_last_timing = threading.local()
 
 from pathlib import Path
 
@@ -47,118 +40,6 @@ def _sanitizer_available(sanitizer_type):
 def _use_pim():
     return os.getenv("TRITON_USE_PIM", "").lower() in ("1", "true", "on", "yes", "y")
 
-def _use_pim_mlir() -> bool:
-    return _use_pim() and os.getenv("TRITON_PIM_MLIR", "").lower() in ("1", "true", "on", "yes", "y")
-
-def _get_ptr(obj):
-    if isinstance(obj, int):
-        return obj
-    if obj is None:
-        return 0
-    if hasattr(obj, "data_ptr"):
-        return int(obj.data_ptr())
-    return int(obj)
-
-
-def _ceil_div(numerator, denominator):
-    return (numerator + denominator - 1) // denominator
-
-def _launch_pim(pim_meta, args, grid_m=0, grid_n=0):
-    # Lazy import to avoid loading DPU runtime when not needed.
-    from . import pim_runtime
-    from . import pim_autotune
-
-    if not pim_meta:
-        raise RuntimeError("PIM launch requested but pim_meta is missing")
-
-    a_idx = pim_meta.get("a_ptr")
-    b_idx = pim_meta.get("b_ptr")
-    c_idx = pim_meta.get("c_ptr")
-    m_idx = pim_meta.get("m_arg")
-    n_idx = pim_meta.get("n_arg")
-    k_idx = pim_meta.get("k_arg")
-    m_val = pim_meta.get("m_val")
-    n_val = pim_meta.get("n_val")
-    k_val = pim_meta.get("k_val")
-
-    if a_idx is None or b_idx is None or c_idx is None:
-        raise RuntimeError("Missing PIM pointer indices in metadata")
-    a_ptr = _get_ptr(args[a_idx])
-    b_ptr = _get_ptr(args[b_idx])
-    c_ptr = _get_ptr(args[c_idx])
-
-    if m_idx is not None and n_idx is not None and k_idx is not None:
-        m = int(args[m_idx])
-        n = int(args[n_idx])
-        k = int(args[k_idx])
-    elif m_val is not None and n_val is not None and k_val is not None:
-        m = int(m_val)
-        n = int(n_val)
-        k = int(k_val)
-    else:
-        raise RuntimeError("Missing PIM M/N/K metadata")
-
-    block = pim_meta.get("block", None)
-    if not block or len(block) != 3:
-        raise RuntimeError("Missing PIM block metadata")
-    bm, bk, bn = [int(x) for x in block]
-    launch_kind = pim_meta.get("launch_kind", "grid2d")
-
-    transb = 1 if pim_meta.get("transb", False) else 0
-    schedule = pim_meta.get("schedule", "global_tile_static")
-    if schedule == "global_tile_static":
-        schedule_policy = 1
-    else:
-        raise RuntimeError(f"Unsupported PIM schedule policy: {schedule}")
-    ndpu = int(os.getenv("TRITON_PIM_NDPU", "1"))
-    dpu_binary = os.getenv(
-        "TRITON_PIM_DPU_BINARY",
-        "/home/dlrkdals/PGEMMlib/PGEMMLib_With_AutoTuner/dpu/gemm_dpu_triton",
-    )
-
-    effective_grid_m = grid_m
-    effective_grid_n = grid_n
-    if launch_kind == "flattened_grouped_mm":
-        effective_grid_m = _ceil_div(m, bm)
-        effective_grid_n = _ceil_div(n, bn)
-    elif effective_grid_m == 0 or effective_grid_n == 0:
-        effective_grid_m = _ceil_div(m, bm)
-        effective_grid_n = _ceil_div(n, bn)
-
-    # Determine active_dpus — three priority levels:
-    #   1. pim_meta["active_dpus"]: set when ACTIVE_DPUS is a kernel constexpr
-    #      and the compiler embeds it in metadata (future: Path 1 constexpr route).
-    #   2. TRITON_PIM_ACTIVE_DPUS env var: set by CachingAutotuner.bench() (Path 1)
-    #      or PIMNativeAutotuner._bench() (Path 2) before each benchmark call.
-    #   3. Fallback to legacy sweep via pim_autotune (backward compatibility).
-    active_dpus = pim_meta.get("active_dpus")
-
-    if active_dpus is None:
-        env_val = os.environ.get("TRITON_PIM_ACTIVE_DPUS")
-        if env_val is not None:
-            active_dpus = int(env_val)
-
-    if active_dpus is None:
-        # Legacy path: run sweep and cache result (kept for backward compat)
-        active_dpus = pim_autotune.get_best_active_dpus(
-            m, n, k, bm, bk, bn, ndpu, transb, schedule_policy, dpu_binary,
-            a_ptr, b_ptr, c_ptr, effective_grid_m, effective_grid_n,
-        )
-
-    stats = pim_runtime.pim_launch(
-        a_ptr, b_ptr, c_ptr,
-        m, k, n,
-        bm, bk, bn,
-        ndpu, transb, schedule_policy, dpu_binary,
-        grid_m=effective_grid_m, grid_n=effective_grid_n,
-        forced_active_dpus=active_dpus,
-    )
-
-    # Store PIM-internal timing so get_benchmarker() can return accurate results.
-    if stats is not None and hasattr(stats, "total_ms"):
-        _pim_last_timing.ms = stats.total_ms
-
-    return None
 
 # -------------------- PIM-MLIR runtime stub ---------------
 def _pim_runtime_stub() -> str:
@@ -451,14 +332,11 @@ def compile_module(launcher_src, kernel_placeholder_name):
         gridX, gridY, gridZ, stream, cu_function,
         kernel_metadata, launch_metadata,
         launch_enter_hook, launch_exit_hook, *args):
-        pim_meta = kernel_metadata[7] if len(kernel_metadata) > 7 else None
         pim_mlir_dispatch = kernel_metadata[8] if len(kernel_metadata) > 8 else False
         if _use_pim() and pim_mlir_dispatch:
             # MLIR-lowered path: kernel calls triton_pim_matmul internally.
             # Override grid to (1,1,1) — pim.matmul handles the full matrix.
             gridX = gridY = gridZ = 1
-        elif _use_pim() and pim_meta:
-            return _launch_pim(pim_meta, args, grid_m=gridX, grid_n=gridY)
         # Unlike CUDA/HIP, we cannot easily pass function pointer across different pybind libraries.
         # Let's compile one kernel every time.
         # The cu_function parameter actually contains our kernel obj.
@@ -635,32 +513,8 @@ class CPUDriver(DriverBase):
         return False
 
     def get_benchmarker(self):
-        if not _use_pim():
-            from triton.testing import do_bench
-            return do_bench
-
-        # PIM-aware benchmarker: uses pim_runtime's internal timing
-        # (stored in _pim_last_timing by _launch_pim) rather than Python
-        # wall-clock, eliminating Python call-overhead from measurements.
-        def _pim_bench(kernel_call, quantiles=(0.5, 0.2, 0.8)):
-            _WARMUP = 1
-            _REPEAT = 3
-
-            for _ in range(_WARMUP):
-                kernel_call()
-
-            times = []
-            for _ in range(_REPEAT):
-                kernel_call()
-                ms = getattr(_pim_last_timing, "ms", None)
-                times.append(ms if ms is not None else float("inf"))
-
-            times.sort()
-            n = len(times)
-            # Return (median, low, high) matching triton do_bench quantile format
-            return [times[n // 2], times[0], times[-1]]
-
-        return _pim_bench
+        from triton.testing import do_bench
+        return do_bench
 
     def get_device_capability(self):
         return ("cpu", 0)

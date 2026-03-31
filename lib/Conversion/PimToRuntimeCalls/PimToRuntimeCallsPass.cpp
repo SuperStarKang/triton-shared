@@ -157,8 +157,21 @@ struct PimToRuntimeCallsPass
       Value splitAxis  = cI32(static_cast<int32_t>(plan.getSplitAxis()));
       Value reusePol   = cI32(static_cast<int32_t>(plan.getReusePolicy()));
       Value reduction  = cI32(static_cast<int32_t>(plan.getReduction()));
-      Value tasklets   = cI32(plan.getTasklets());
-      Value activeDpus = cI32(plan.getActiveDpus());
+      // tasklets: TRITON_PIM_TASKLETS env var > plan value > default 16.
+      const char* tlEnv = getenv("TRITON_PIM_TASKLETS");
+      int32_t hwTasklets = plan.getTasklets() > 0 ? plan.getTasklets() : 16;
+      if (tlEnv && *tlEnv) hwTasklets = (int32_t)atoi(tlEnv);
+      Value tasklets = cI32(hwTasklets);
+
+      // active_dpus: TRITON_PIM_NDPU env var > plan value > 2560.
+      // Read at opt-run time (subprocess inherits caller's env).
+      // PGEMM clamps internally to min(active_dpus, total_tiles), so passing
+      // the physical DPU count maximally utilises hardware for any matrix size.
+      const char* ndpuEnv = getenv("TRITON_PIM_NDPU");
+      int32_t hwDpus = (ndpuEnv && *ndpuEnv) ? (int32_t)atoi(ndpuEnv)
+                                              : plan.getActiveDpus();
+      if (hwDpus <= 0) hwDpus = 2560;
+      Value activeDpus = cI32(hwDpus);
       Value kernelVar  = cI32(static_cast<int32_t>(plan.getKernelVariant()));
       Value packFmt    = cI32(static_cast<int32_t>(plan.getPackFormat()));
       Value accumType  = cI32(static_cast<int32_t>(plan.getAccumType()));

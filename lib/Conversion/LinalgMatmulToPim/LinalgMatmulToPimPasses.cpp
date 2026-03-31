@@ -507,9 +507,15 @@ struct PimPlanMaterializePass
         wm = pim::WritebackMode::DIRECT;
 
       // ----------------------------------------------------------------
-      // Compute active_dpus from static C-matrix dimensions.
+      // Compute active_dpus: prefer TRITON_PIM_NDPU env var, then static
+      // shape, then kMaxDpus.  PimToRuntimeCallsPass also reads the env var
+      // at opt-run time and embeds the exact value as a constant — this pass
+      // only stores it in the plan attr for debugging / verification purposes.
       // ----------------------------------------------------------------
-      constexpr int32_t kMaxDpus = 2560;
+      const char* ndpuEnv = getenv("TRITON_PIM_NDPU");
+      const int32_t kMaxDpus = (ndpuEnv && *ndpuEnv)
+                                   ? (int32_t)atoi(ndpuEnv)
+                                   : 2560;
       int32_t activeDpus = plan.getActiveDpus();
       if (activeDpus == 0) {
         // Static shape is only available for ranked memrefs.
@@ -536,7 +542,9 @@ struct PimPlanMaterializePass
       // ----------------------------------------------------------------
       // Fixed hardware defaults.
       // ----------------------------------------------------------------
-      int32_t tasklets   = plan.getTasklets()   > 0 ? plan.getTasklets()   : 16;
+      const char* tlEnv  = getenv("TRITON_PIM_TASKLETS");
+      int32_t tasklets   = plan.getTasklets() > 0 ? plan.getTasklets()
+                           : (tlEnv && *tlEnv) ? (int32_t)atoi(tlEnv) : 16;
       int32_t alignment  = plan.getAlignment()  > 0 ? plan.getAlignment()  : 8;
       int32_t groupM     = plan.getGroupM();
       int32_t batchCount = plan.getBatchCount() > 0 ? plan.getBatchCount() : 1;

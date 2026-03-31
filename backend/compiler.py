@@ -67,100 +67,8 @@ def _ttir_to_ttsharedir(mod):
         return Path(dst_path).read_text()
 
 
-def _use_pim_ir() -> bool:
+def _use_pim() -> bool:
     return os.getenv("TRITON_USE_PIM", "").lower() in ("1", "true", "on", "yes", "y")
-
-
-def _use_pim_mlir() -> bool:
-    """True when both TRITON_USE_PIM and TRITON_PIM_MLIR are set."""
-    return _use_pim_ir() and os.getenv("TRITON_PIM_MLIR", "").lower() in ("1", "true", "on", "yes", "y")
-
-
-# Pattern to extract upmem.* attributes emitted by --linalg-matmul-to-upmem.
-# After the pass, the function looks like:
-#   func.func @kernel(...) attributes { upmem.bm = 32 : i32, ... } { ... }
-_UPMEM_INT_ATTR  = re.compile(r"upmem\.(\w+)\s*=\s*(-?\d+)\s*:")
-_UPMEM_STR_ATTR  = re.compile(r'upmem\.(\w+)\s*=\s*"([^"]+)"')
-
-
-def _extract_upmem_meta(annotated_ir: str) -> dict:
-    """Extract pim_meta from upmem.* function attributes set by --linalg-matmul-to-upmem.
-
-    The pass annotates the enclosing func.func with structured attributes:
-        upmem.bm = 32 : i32
-        upmem.a_ptr_idx = 0 : i32
-        upmem.elem_type = "i8"
-        ...
-    This function builds the same pim_meta dict that the legacy regex approach
-    (_extract_pim_meta) produces, so the runtime (driver.py) is unchanged.
-    """
-    # Collect all integer and string upmem.* attributes.
-    int_attrs  = {k: int(v) for k, v in _UPMEM_INT_ATTR.findall(annotated_ir)}
-    str_attrs  = {k: v      for k, v in _UPMEM_STR_ATTR.findall(annotated_ir)}
-
-    # A matmul was found only if at least bm/bk/bn are present.
-    if not all(k in int_attrs for k in ("bm", "bk", "bn")):
-        return {}
-
-    required_pointer_indices = ("a_ptr_idx", "b_ptr_idx", "c_ptr_idx")
-    if not all(k in int_attrs for k in required_pointer_indices):
-        return {}
-
-    has_runtime_sizes = all(k in int_attrs for k in ("m_idx", "n_idx", "k_idx"))
-    has_static_sizes = all(k in int_attrs for k in ("m_val", "n_val", "k_val"))
-    if not has_runtime_sizes and not has_static_sizes:
-        return {}
-
-    meta = {
-        "a_ptr":    int_attrs["a_ptr_idx"],
-        "b_ptr":    int_attrs["b_ptr_idx"],
-        "c_ptr":    int_attrs["c_ptr_idx"],
-        "block":    [int_attrs["bm"], int_attrs["bk"], int_attrs["bn"]],
-        "transb":   False,
-        "dtype":    str_attrs.get("elem_type", "i8"),
-        "schedule": "global_tile_static",
-        "launch_kind": str_attrs.get("launch_kind", "grid2d"),
-    }
-    if "group_m" in int_attrs:
-        meta["group_m"] = int_attrs["group_m"]
-    if has_runtime_sizes:
-        meta.update(
-            {
-                "m_arg": int_attrs["m_idx"],
-                "n_arg": int_attrs["n_idx"],
-                "k_arg": int_attrs["k_idx"],
-            }
-        )
-    else:
-        meta.update(
-            {
-                "m_val": int_attrs["m_val"],
-                "n_val": int_attrs["n_val"],
-                "k_val": int_attrs["k_val"],
-            }
-        )
-    return meta
-
-
-def _ttsharedir_to_pimir(ttsharedir: str, metadata: dict) -> str:
-    """Extract PIM metadata via --linalg-matmul-to-upmem MLIR pass."""
-    tso_path = _get_triton_shared_opt_path()
-    with tempfile.TemporaryDirectory() as tmpdir:
-        src = os.path.join(tmpdir, "ttshared.mlir")
-        dst = os.path.join(tmpdir, "ttshared_annotated.mlir")
-        Path(src).write_text(ttsharedir)
-        subprocess.check_call(
-            [tso_path, src, "--linalg-matmul-to-upmem", "-o", dst],
-        )
-        annotated_ir = Path(dst).read_text()
-        pim_meta = _extract_upmem_meta(annotated_ir) or None
-
-        dump_dir = os.getenv("TRITON_SHARED_DUMP_PATH")
-        if dump_dir and pim_meta:
-            Path(os.path.join(dump_dir, "ttshared_annotated.mlir")).write_text(annotated_ir)
-
-    metadata["pim_meta"] = pim_meta
-    return _ttsharedir_to_llir(ttsharedir)
 
 
 def _ttsharedir_to_pim_mlir_and_llir(ttsharedir: str, metadata: dict) -> str:
@@ -210,7 +118,6 @@ def _ttsharedir_to_pim_mlir_and_llir(ttsharedir: str, metadata: dict) -> str:
             # last successful pim_lowered.mlir.
             Path(os.path.join(dump_dir, "pim_lowered_fallback.mlir")).write_text(pim_ir)
     # Set pim_meta only when the pipeline actually produced a triton_pim_matmul call.
-    # None → driver.py's _launch_pim branch is skipped entirely (CPU fallback).
     if pim_converted:
         metadata["pim_meta"] = {"pim_mlir_dispatch": True}
     else:
@@ -425,10 +332,8 @@ class CPUBackend(BaseBackend):
     def add_stages(self, stages, options, language):
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
         stages["ttsharedir"] = lambda src, metadata: _optimize_ttsharedir(_ttir_to_ttsharedir(src))
-        if _use_pim_mlir():
+        if _use_pim():
             stages["llir"] = lambda src, metadata: _optimize_llir(_ttsharedir_to_pim_mlir_and_llir(src, metadata))
-        elif _use_pim_ir():
-            stages["llir"] = lambda src, metadata: _optimize_llir(_ttsharedir_to_pimir(src, metadata))
         else:
             stages["llir"] = lambda src, metadata: _optimize_llir(_ttsharedir_to_llir(src))
         stages["obj"] = lambda src, metadata: _llir_to_bin(src, metadata)
